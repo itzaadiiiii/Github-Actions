@@ -1,0 +1,84 @@
+
+# Promote Payment Service to QA
+name: Promote Payment Service to QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: Immutable ECR image digest
+        required: true
+        type: string
+
+      build_version:
+        description: CI build or commit reference
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  qa-deployment:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: qa
+      url: https://qa-api.example.com
+
+    steps:
+
+      - name: Checkout GitOps
+        uses: actions/checkout@v4
+        with:
+          repository: company/fintech-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Validate image digest
+        env:
+          DIGEST: ${{ inputs.image_digest }}
+        run: |
+          echo "$DIGEST" | grep -Eq '^sha256:[a-f0-9]{64}$'
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --key cosign.pub \
+            123456789012.dkr.ecr.ap-south-1.amazonaws.com/payment-service@${{ inputs.image_digest }}
+
+      - name: Update QA values
+        env:
+          DIGEST: ${{ inputs.image_digest }}
+        run: |
+          yq -i '.image.digest = strenv(DIGEST)' \
+            applications/payment-service/environments/qa-values.yaml
+
+      - name: Validate Helm
+        run: |
+          helm lint applications/payment-service/helm
+
+          helm template payment-service \
+            applications/payment-service/helm \
+            -f applications/payment-service/environments/qa-values.yaml \
+            > rendered.yaml
+
+          checkov -f rendered.yaml
+          trivy config --exit-code 1 rendered.yaml
+
+      - name: Commit GitOps change
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@company.com"
+          git add .
+          git commit -m "Promote payment-service to QA"
+          git push
+
+      - name: Notify QA
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_QA_WEBHOOK }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"Payment Service deployed to QA. Testing can begin."}' \
+            "$SLACK_WEBHOOK"
