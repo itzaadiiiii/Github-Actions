@@ -1,0 +1,44 @@
+# Database Migration CI
+name: Database Migration CI
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate migrations
+        run: flyway validate
+
+      - name: Check SQL formatting
+        run: sqlfluff lint migrations/
+
+  dev-migration:
+    needs: validate
+    runs-on: ubuntu-latest
+
+    environment: database-dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply migration
+        run: |
+          ./scripts/run-flyway.sh dev
+
+      - name: Database integration tests
+        run: |
+          ./scripts/database-integration-tests.sh dev
