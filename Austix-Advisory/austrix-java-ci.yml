@@ -1,0 +1,198 @@
+name: Reusable Java Microservice CI
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        required: true
+        type: string
+
+      java_version:
+        required: false
+        type: string
+        default: "21"
+
+      ecr_repository:
+        required: true
+        type: string
+
+    outputs:
+      image_digest:
+        description: Immutable ECR image digest
+        value: ${{ jobs.publish.outputs.image_digest }}
+
+      image_uri:
+        description: ECR image URI
+        value: ${{ jobs.publish.outputs.image_uri }}
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+
+  checkout:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+  code-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Checkstyle
+        run: mvn checkstyle:check
+
+      - name: Unit tests
+        run: mvn test
+
+      - name: SonarQube
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn verify sonar:sonar \
+            -Dsonar.projectKey=${{ inputs.service_name }} \
+            -Dsonar.token=$SONAR_TOKEN
+
+  filesystem-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  build:
+    needs:
+      - code-quality
+      - filesystem-scan
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Build application
+        run: mvn clean package -DskipTests
+
+      - name: Upload application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: target/*.jar
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_digest: ${{ steps.image.outputs.digest }}
+      image_uri: ${{ steps.image.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download application artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar
+          path: target
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr_repository }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker buildx build \
+            --push \
+            --tag $REGISTRY/$REPOSITORY:$TAG \
+            --metadata-file build-metadata.json \
+            .
+
+      - name: Extract immutable digest
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr_repository }}
+        run: |
+          DIGEST=$(jq -r '."containerimage.digest"' build-metadata.json)
+
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "uri=$REGISTRY/$REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Scan pushed image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image.outputs.uri }}@${{ steps.image.outputs.digest }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image.outputs.uri }}@${{ steps.image.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Sign image using Cosign
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}@${{ steps.image.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            --key awskms:///alias/fintech-image-signing \
+            "$IMAGE"
+
+      - name: Attest SBOM
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}@${{ steps.image.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --key awskms:///alias/fintech-image-signing \
+            --type cyclonedx \
+            --predicate sbom.json \
+            "$IMAGE"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
