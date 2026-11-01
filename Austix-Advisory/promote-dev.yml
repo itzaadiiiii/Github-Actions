@@ -1,0 +1,63 @@
+# Promote to Deb
+name: Promote to Dev
+
+on:
+  workflow_run:
+    workflows:
+      - Payment Service CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  deploy-dev:
+    if: github.event.workflow_run.conclusion == 'success'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: company/fintech-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: fintech-gitops
+
+      - name: Update Dev Helm values
+        working-directory: fintech-gitops
+        env:
+          IMAGE_DIGEST: ${{ needs.ci.outputs.image_digest }}
+        run: |
+          echo "Update image digest in dev-values.yaml"
+          # Use yq to update image.repository and image.digest.
+          # Commit the resulting change or create a PR.
+
+      - name: Validate Helm
+        working-directory: fintech-gitops
+        run: |
+          helm lint applications/payment-service/helm
+
+          helm template payment-service \
+            applications/payment-service/helm \
+            -f applications/payment-service/environments/dev-values.yaml \
+            > rendered.yaml
+
+      - name: Checkov
+        working-directory: fintech-gitops
+        run: checkov -f rendered.yaml
+
+      - name: Trivy Config
+        working-directory: fintech-gitops
+        run: trivy config --exit-code 1 rendered.yaml
+
+      - name: Notify Dev
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_DEV_WEBHOOK }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"Payment Service Dev deployment change created"}' \
+            "$SLACK_WEBHOOK"
