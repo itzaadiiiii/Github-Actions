@@ -7,7 +7,7 @@ platform-ci-templates/
 │
 └── .github/
     └── workflows/
-        ├── java-ci.yml
+        ├── austrix-java-ci.yml
         ├── frontend-ci.yml
         ├── database-ci.yml
         ├── promote-dev.yml
